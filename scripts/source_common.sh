@@ -1,2 +1,2 @@
-WORKSPACE_DIR=$HOME/.holosoma_deps
-CONDA_ROOT=$WORKSPACE_DIR/miniconda3
+WORKSPACE_DIR=/scratch/gpfs/TSILVER/kp0374/.holosoma_deps
+CONDA_ROOT=/scratch/gpfs/TSILVER/kp0374/conda
