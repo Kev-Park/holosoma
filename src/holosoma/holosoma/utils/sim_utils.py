@@ -38,16 +38,15 @@ def setup_simulator_imports(config: ExperimentConfig | RunSimConfig) -> None:
     config : ExperimentConfig | RunSimConfig
         Configuration containing simulator settings.
     """
-    print("\n\n\nsimulator type: ", config.simulator)
     set_simulator_type(config.simulator)
     simulator_type = get_simulator_type()
 
     if simulator_type == SimulatorType.MUJOCO:
-        import mujoco  # noqa: PLC0415
+        import mujoco
 
         assert mujoco is not None
     elif simulator_type == SimulatorType.ISAACGYM:
-        import isaacgym  # noqa: PLC0415
+        import isaacgym
 
         assert isaacgym is not None
 
@@ -69,7 +68,7 @@ def setup_isaaclab_launcher(config: ExperimentConfig | RunSimConfig, device: str
     Any | None
         IsaacSim simulation app instance, or None for other simulators.
     """
-    from isaaclab.app import AppLauncher  # noqa: PLC0415
+    from isaaclab.app import AppLauncher
 
     parser = argparse.ArgumentParser(description="Run simulation with IsaacSim.")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
@@ -81,8 +80,12 @@ def setup_isaaclab_launcher(config: ExperimentConfig | RunSimConfig, device: str
     # Parse known arguments to get argparse params
     args_cli, unknown_args = parser.parse_known_args()
 
-    # Set values from config
-    args_cli.num_envs = config.training.num_envs
+    # Set values from config — divide by world_size for multi-GPU so each rank's
+    # AppLauncher only allocates resources for its share of environments.
+    # (The full num_envs is divided again in train_agent.train(), but AppLauncher
+    # needs the per-rank count at init time to avoid over-allocating GPU memory.)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    args_cli.num_envs = config.training.num_envs // world_size if world_size > 1 else config.training.num_envs
     args_cli.seed = config.training.seed
     args_cli.env_spacing = config.simulator.config.scene.env_spacing
     args_cli.output_dir = config.logger.base_dir
@@ -90,6 +93,7 @@ def setup_isaaclab_launcher(config: ExperimentConfig | RunSimConfig, device: str
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
         # Distribute simulator across GPUs when using multi-gpu training
         args_cli.device = f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
+        args_cli.distributed = True
     elif device is not None:
         # Use the resolved device
         args_cli.device = device
@@ -152,7 +156,7 @@ def setup_keyboard_listener(env) -> threading.Thread:
             # Trying to import pynput in headless mode gives the following error:
             # ImportError: this platform is not supported:
             # ('failed to acquire X connection: Bad display name ""', DisplayNameError(''))
-            from pynput import keyboard as pynput_keyboard  # noqa: PLC0415
+            from pynput import keyboard as pynput_keyboard
 
             logger.info("Keyboard controls:")
             logger.info("  n - Next task (if supported)")
@@ -293,7 +297,7 @@ def close_simulation_app(simulation_app):
         try:
             # Work-around for IsaacLab hanging headless.
             # Patch the close_stage method to avoid hanging
-            import omni.usd  # noqa: PLC0415
+            import omni.usd
 
             context = omni.usd.get_context()
             context_class = context.__class__
@@ -308,6 +312,20 @@ def close_simulation_app(simulation_app):
             logger.info("Successfully patched close_stage method")
         except Exception as e:
             logger.warning(f"Could not patch close_stage method: {e}")
+
+        try:
+            # Work-around for IsaacLab SimulationContext._app_control_on_stop_handle_fn
+            # hanging in an infinite render() loop on shutdown. When simulation_app.close()
+            # triggers a timeline STOP event, the callback spins waiting for the timeline to
+            # start playing again — which never happens. Disabling the callback prevents this.
+            from isaaclab.sim import SimulationContext
+
+            sim_context = SimulationContext.instance()
+            if sim_context is not None:
+                sim_context._disable_app_control_on_stop_handle = True
+                logger.info("Disabled SimulationContext app_control_on_stop_handle to prevent shutdown hang")
+        except Exception as e:
+            logger.warning(f"Could not disable app_control_on_stop_handle: {e}")
 
         # Now close the app
         simulation_app.close(wait_for_replicator=False)

@@ -117,6 +117,9 @@ class RobotConfig:
     If provided, these values override the ONNX metadata.
     """
 
+    default_per_joint_action_scale: tuple[float, ...] | None = None
+    """Fallback per-joint action scales used when ONNX metadata is missing."""
+
     # =========================================================================
     # WBT Stiff Startup Configuration (OPTIONAL - for WBT policies)
     # =========================================================================
@@ -219,3 +222,15 @@ class RobotConfig:
 
     num_upper_body_joints: int = 14
     """Number of upper body degrees of freedom."""
+
+    # =========================================================================
+    # Per-Robot Calibration
+    # =========================================================================
+
+    joint_offsets_deg: tuple[float, ...] | None = None
+    """Per-joint offsets in degrees applied to lowcmd (action-space only).
+
+    These offsets correct for per-robot motor calibration differences without
+    affecting the observation/state space. Converted to radians at init time.
+    Length must equal num_joints when provided.
+    """

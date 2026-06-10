@@ -16,6 +16,8 @@ from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 from tqdm import tqdm
 from viser.extras import ViserUrdf  # type: ignore[import-not-found]
 
+from holosoma_retargeting.config_types.retargeter import FootLockConfig, SelfCollisionConfig
+
 # Add src to path for direct execution
 src_path = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(src_path))
@@ -53,6 +55,8 @@ class InteractionMeshRetargeter:
         collision_detection_threshold: float = 0.1,
         penetration_tolerance: float = 1e-3,
         foot_sticking_tolerance: float = 1e-3,
+        foot_lock: FootLockConfig | None = None,
+        self_collision: SelfCollisionConfig | None = None,
         visualize: bool = False,
         debug: bool = False,
         w_nominal_tracking_init: float = 5.0,
@@ -76,6 +80,7 @@ class InteractionMeshRetargeter:
             when the distance is smaller than this threshold.
             penetration_tolerance: tolerance for penetration when enforcing non-penetration constraints.
             foot_sticking_tolerance: tolerance for foot sticking constraints in x, y.
+            foot_lock: configuration for explicit frame-range based foot locking constraints.
             nominal_tracking_tau: the time constant for the nominal tracking cost.
         """
 
@@ -102,6 +107,8 @@ class InteractionMeshRetargeter:
         self.smooth_weight = 0.2
         # Tolerance for foot sticking constraints in x, y.
         self.foot_sticking_tolerance = foot_sticking_tolerance
+        self._init_foot_lock(foot_lock)
+        self._self_collision_config = self_collision
 
         # Setup visualization if requested
         if self.visualize:
@@ -119,6 +126,7 @@ class InteractionMeshRetargeter:
         print("Loading robot model from: ", robot_xml_path)
 
         self.robot_data = mujoco.MjData(self.robot_model)
+        self._init_self_collision(self._self_collision_config)
 
         if self.robot_data.qpos.shape[0] > 7 + self.task_constants.ROBOT_DOF:
             self.has_dynamic_object = True
@@ -164,6 +172,73 @@ class InteractionMeshRetargeter:
         self.w_nominal_tracking_init = w_nominal_tracking_init
         self.nominal_tracking_tau = nominal_tracking_tau
         self.track_nominal_indices = task_constants.NOMINAL_TRACKING_INDICES
+
+    def _init_foot_lock(self, foot_lock: FootLockConfig | None) -> None:
+        """Initialize foot lock configuration and normalize window mappings."""
+        self.foot_lock = foot_lock or FootLockConfig()
+        self._foot_lock_windows: dict[str, tuple[tuple[int, int], ...]] = {"left": (), "right": ()}
+        if self.foot_lock.windows is None:
+            return
+        for key, windows in self.foot_lock.windows.items():
+            key_lower = key.lower()
+            side = None
+            if key_lower.startswith("l") or ("left" in key_lower):
+                side = "left"
+            elif key_lower.startswith("r") or ("right" in key_lower):
+                side = "right"
+            if side is None:
+                continue
+
+            normalized_windows: list[tuple[int, int]] = []
+            for window in windows:
+                if len(window) != 2:
+                    raise ValueError(f"Invalid foot lock window for {key}: {window}")
+                start, end = int(window[0]), int(window[1])
+                if end < start:
+                    raise ValueError(f"Invalid foot lock window with end < start for {key}: {window}")
+                normalized_windows.append((start, end))
+            self._foot_lock_windows[side] = tuple(normalized_windows)
+
+    def _init_self_collision(self, self_collision: SelfCollisionConfig | None) -> None:
+        """Initialize self-collision configuration and precompute geom pairs."""
+        sc = self_collision or SelfCollisionConfig()
+        self._self_collision_enabled = sc.enable and len(sc.pairs) > 0
+        self._self_collision_tolerance = sc.tolerance
+        self._self_collision_windows: list[tuple[int, int]] | None = sc.windows
+        self._self_collision_geom_pairs: list[tuple[int, int]] = []
+
+        self._sc_last_vis_frame = -1
+
+        if not self._self_collision_enabled:
+            return
+
+        m = self.robot_model
+
+        # Build body_name → [geom_ids] mapping (only geoms with collision enabled)
+        body_to_geoms: dict[str, list[int]] = {}
+        for g in range(m.ngeom):
+            if m.geom_contype[g] == 0 and m.geom_conaffinity[g] == 0:
+                continue
+            body_id = m.geom_bodyid[g]
+            body_name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+            body_to_geoms.setdefault(body_name, []).append(g)
+
+        # Build geom pairs from body name pairs
+        for body_a, body_b in sc.pairs:
+            geoms_a = body_to_geoms.get(body_a, [])
+            geoms_b = body_to_geoms.get(body_b, [])
+            if not geoms_a:
+                print(f"[SelfCollision] Warning: no collision geoms found for body '{body_a}'")
+            if not geoms_b:
+                print(f"[SelfCollision] Warning: no collision geoms found for body '{body_b}'")
+            for ga in geoms_a:
+                for gb in geoms_b:
+                    self._self_collision_geom_pairs.append((ga, gb))
+
+        print(
+            f"[SelfCollision] Initialized with {len(self._self_collision_geom_pairs)} geom pairs "
+            f"from {len(sc.pairs)} body pairs, tolerance={sc.tolerance}m"
+        )
 
     def _setup_visualization(self):
         """Setup Viser visualization components."""
@@ -397,6 +472,7 @@ class InteractionMeshRetargeter:
                     q_a_nominal=(q_nominal_list[i, self.q_a_indices] if q_nominal_list is not None else None),
                     init_t=i == 0,
                     n_iter=50 if i == 0 else 10,
+                    frame_idx=i,
                 )
                 if self.debug:
                     robot_link_positions = self._get_robot_link_positions(
@@ -487,6 +563,7 @@ class InteractionMeshRetargeter:
         q_a_nominal: np.ndarray | None = None,
         verbose=False,
         init_t=False,
+        frame_idx: int = 0,
     ):
         """The main function to solve a single iteration of the DiffIK problem.
         Args:
@@ -499,6 +576,7 @@ class InteractionMeshRetargeter:
             smpl_joints_original: the original SMPL joint positions (used for contact matching).
             obj_original: the original object pose (used for contact matching).
             init_t: the current time step is the first time step.
+            frame_idx: frame index used by explicit foot lock window constraints.
         """
         assert len(q_a_n_last) == self.nq_a
 
@@ -547,31 +625,51 @@ class InteractionMeshRetargeter:
         # Linear equality
         constraints += [cp.Constant(J_L[:, self.q_a_indices]) @ dqa - lap_var == -lap0_vec]
 
-        # Foot sticking
-        if (self.q_a_init_idx < 12) and self.activate_foot_sticking:
+        # Foot constraints (sticking + foot lock window Z pinning)
+        apply_foot_sticking = (self.q_a_init_idx < 12) and self.activate_foot_sticking
+        apply_foot_lock = (self.q_a_init_idx < 12) and self.foot_lock.enable
+        if apply_foot_sticking or apply_foot_lock:
             J_WF_dict, p_WF_dict, _ = self._calc_manipulator_jacobians(q, links=self.foot_links, obj_frame=False)
-            _, p_WF_t_last_dict, _ = self._calc_manipulator_jacobians(q_t_last, links=self.foot_links, obj_frame=False)
-            # Identify 'left' and 'right' flags from provided keys
-            left_key = right_key = None
-            for key in foot_sticking:
-                if key.lower().startswith("l"):
-                    left_key = key
-                elif key.lower().startswith("r"):
-                    right_key = key
-            if left_key is None or right_key is None:
-                raise ValueError("foot_sticking must include one left* and one right* key")
 
-            for key, J_WF in J_WF_dict.items():
-                apply_left = ("left" in key) and foot_sticking[left_key]
-                apply_right = ("right" in key) and foot_sticking[right_key]
-                if apply_left or apply_right:
-                    p_lb = p_WF_t_last_dict[key] - p_WF_dict[key] - self.foot_sticking_tolerance
-                    p_ub = p_lb + 2 * self.foot_sticking_tolerance  # symmetric window
+            # Foot sticking: constrain XY to stay near previous frame position
+            if apply_foot_sticking:
+                _, p_WF_t_last_dict, _ = self._calc_manipulator_jacobians(
+                    q_t_last, links=self.foot_links, obj_frame=False
+                )
+                left_key = right_key = None
+                for key in foot_sticking:
+                    if key.lower().startswith("l"):
+                        left_key = key
+                    elif key.lower().startswith("r"):
+                        right_key = key
+                if left_key is None or right_key is None:
+                    raise ValueError("foot_sticking must include one left* and one right* key")
 
-                    Jxy = J_WF[:2, self.q_a_indices]  # (2 x nq_act)
+                for key, J_WF in J_WF_dict.items():
+                    apply_left = ("left" in key) and foot_sticking[left_key]
+                    apply_right = ("right" in key) and foot_sticking[right_key]
+                    if apply_left or apply_right:
+                        p_lb = p_WF_t_last_dict[key] - p_WF_dict[key] - self.foot_sticking_tolerance
+                        p_ub = p_lb + 2 * self.foot_sticking_tolerance  # symmetric window
+
+                        Jxy = J_WF[:2, self.q_a_indices]  # (2 x nq_act)
+                        constraints += [
+                            Jxy @ dqa >= p_lb[:2],
+                            Jxy @ dqa <= p_ub[:2],
+                        ]
+
+            # Foot lock windows: pin Z to floor within configured frame ranges
+            if apply_foot_lock:
+                for key, J_WF in J_WF_dict.items():
+                    if not self._is_foot_locked_in_window(key, frame_idx):
+                        continue
+
+                    z_anchor = self.foot_lock.z_floor
+                    z_delta = z_anchor - p_WF_dict[key][2]
+                    Jz = J_WF[2, self.q_a_indices]
                     constraints += [
-                        Jxy @ dqa >= p_lb[:2],
-                        Jxy @ dqa <= p_ub[:2],
+                        Jz @ dqa >= z_delta - self.foot_lock.tolerance,
+                        Jz @ dqa <= z_delta + self.foot_lock.tolerance,
                     ]
 
         # Non-penetration constraints
@@ -580,6 +678,15 @@ class InteractionMeshRetargeter:
             Ja_n_full = Js[key]
             Ja_n = Ja_n_full[self.q_a_indices]
             rhs = -phi - self.penetration_tolerance
+            constraints += [Ja_n @ dqa >= rhs]
+
+        # Self-collision constraints
+        Js_sc, phis_sc = self._compute_self_collision_constraints(frame_idx)
+        for key, phi in phis_sc.items():
+            Ja_n_full = Js_sc[key]
+            Ja_n = Ja_n_full[self.q_a_indices]
+            # Enforce: new_distance >= tolerance  =>  phi + J @ dqa >= tol
+            rhs = self._self_collision_tolerance - phi
             constraints += [Ja_n @ dqa >= rhs]
 
         # Joint limits constraints (actuated)
@@ -642,6 +749,73 @@ class InteractionMeshRetargeter:
 
         return q_star, cost
 
+    def _is_foot_locked_in_window(self, foot_link_key: str, frame_idx: int) -> bool:
+        """Check whether a foot link is locked by configured frame windows."""
+        key_lower = foot_link_key.lower()
+        side = None
+        if "left" in key_lower:
+            side = "left"
+        elif "right" in key_lower:
+            side = "right"
+        if side is None:
+            return False
+
+        return any(start <= frame_idx <= end for start, end in self._foot_lock_windows.get(side, ()))
+
+    def _compute_self_collision_constraints(self, frame_idx: int):
+        """Compute Jacobians and distances for self-collision body pairs.
+
+        Assumes ``mj_forward`` has already been called with the current q
+        (done by ``_update_jacobians_and_phis_from_q`` which runs first).
+
+        Returns:
+            Js: dict mapping (geom_a, geom_b) -> relative Jacobian (1 x nq)
+            phis: dict mapping (geom_a, geom_b) -> signed distance
+        """
+        if not self._self_collision_enabled:
+            return {}, {}
+
+        # Check frame windows
+        if self._self_collision_windows is not None:
+            if not any(start <= frame_idx <= end for start, end in self._self_collision_windows):
+                return {}, {}
+
+        m, d = self.robot_model, self.robot_data
+        threshold = float(self.collision_detection_threshold)
+
+        Js, phis = {}, {}
+        fromto = np.zeros(6, dtype=float)
+
+        if not hasattr(self, "_geom_names"):
+            raise RuntimeError(
+                "[SelfCollision] _geom_names not initialized. Please run _prefilter_pairs_with_mj_collision first."
+            )
+
+        _first_iter = self._sc_last_vis_frame != frame_idx
+        if _first_iter:
+            self._sc_last_vis_frame = frame_idx
+
+        for geom_a, geom_b in self._self_collision_geom_pairs:
+            fromto[:] = 0.0
+            dist = mujoco.mj_geomDistance(m, d, geom_a, geom_b, threshold, fromto)
+            if dist <= threshold:
+                J_rel = self._compute_jacobian_for_contact_relative(
+                    m.geom(geom_a),
+                    m.geom(geom_b),
+                    self._geom_names[geom_a],
+                    self._geom_names[geom_b],
+                    fromto,
+                    dist,
+                )
+                key = ("self", geom_a, geom_b)
+                Js[key] = J_rel
+                phis[key] = float(dist)
+
+        if _first_iter and self.visualize:
+            self._draw_self_collision_geoms()
+
+        return Js, phis
+
     def iterate(
         self,
         q_locked: np.ndarray,
@@ -655,6 +829,7 @@ class InteractionMeshRetargeter:
         q_a_nominal: np.ndarray | None = None,
         init_t: bool = False,
         n_iter: int = 10,
+        frame_idx: int = 0,
     ):
         """Iterate the solver for multiple iterations."""
         last_cost = np.inf
@@ -671,11 +846,46 @@ class InteractionMeshRetargeter:
                 q_a_nominal=q_a_nominal,
                 w_nominal_tracking=w_nominal_tracking,
                 init_t=init_t,
+                frame_idx=frame_idx,
             )
             if np.isclose(cost, last_cost):
                 break
             last_cost = cost
         return q_n, cost
+
+    def _draw_self_collision_geoms(self):
+        """Draw collision cylinders for self-collision geom pairs in viser."""
+        if not hasattr(self, "server") or not self._self_collision_enabled:
+            return
+        m, d = self.robot_model, self.robot_data
+        seen_geoms: set[int] = set()
+        colors = [(255, 80, 80), (80, 80, 255)]  # red for first body, blue for second
+        for geom_a, geom_b in self._self_collision_geom_pairs:
+            for idx, gid in enumerate([geom_a, geom_b]):
+                if gid in seen_geoms:
+                    continue
+                seen_geoms.add(gid)
+                gtype = int(m.geom_type[gid])
+                if gtype not in (3, 5):  # 3 = capsule, 5 = cylinder
+                    continue
+                radius = float(m.geom_size[gid][0])
+                half_len = float(m.geom_size[gid][1])
+                cyl = trimesh.creation.capsule(radius=radius, height=2 * half_len, count=[16, 16])
+                # World transform from MuJoCo data
+                pos = d.geom_xpos[gid]
+                rot_mat = d.geom_xmat[gid].reshape(3, 3)
+                transform = np.eye(4)
+                transform[:3, :3] = rot_mat
+                transform[:3, 3] = pos
+                cyl.apply_transform(transform)
+                body_name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[gid]) or ""
+                self.server.scene.add_mesh_simple(
+                    f"/world/sc_geom/{body_name}_g{gid}",
+                    vertices=cyl.vertices.astype(np.float32),
+                    faces=cyl.faces.astype(np.int32),
+                    color=colors[idx % 2],
+                    opacity=0.35,
+                )
 
     def draw_q(self, q: np.ndarray):
         """Draw a single robot configuration."""

@@ -20,7 +20,7 @@ dependencies = [
     "mypy==1.14.1",
     "notebook",
     "numpy-stl",
-    "numpy==1.23.5",
+    "numpy>=1.23.5,<2",
     "omegaconf",  # Used for config resolvers and DictConfig type hints
     "onnx",
     "onnxruntime",
@@ -54,6 +54,10 @@ dependencies = [
 
 # Mark optional-dependencies as dynamic since it needs runtime computation
 dynamic = ["optional-dependencies"]
+
+[project.entry-points."holosoma.bridge"]
+unitree = "holosoma.bridge.unitree:UnitreeSdk2Bridge"
+booster = "holosoma.bridge.booster:BoosterSdk2Bridge"
 
 [tool.setuptools.packages.find]
 where = ["."]
