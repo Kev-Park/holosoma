@@ -368,6 +368,20 @@
                 solimp="0.9 0.95 0.001"/>
     </body>
 
+    <!-- Static collision TABLE. A MuJoCo mocap body (no DOF) so it does NOT disturb the
+         [base(7), joints(29), mustard(7)] qpos layout the object logic keys off (q[-7:]). Placed
+         per-motion from the RESTING (pre-grab) bottle pose via robot_data.mocap_pos in
+         interaction_mesh_retargeter.retarget(); non-penetration wired in via masks_ok ("table").
+         Box half-extents 0.5 x 1.0 x 0.43 => full 1 x 2 x 0.86: matches the training-env green-box
+         table footprint (size 1x2) with the top at z=0.86 (legacy refine OFFSET_Z). Default pos
+         below the floor until the retargeter positions it. Only present in the mustard pick scene. -->
+    <body name="table_link" mocap="true" pos="0 0 -1">
+        <geom name="table" type="box" size="0.5 1.0 0.43"
+                contype="1" conaffinity="1"
+                pos="0 0 0" quat="1 0 0 0"
+                rgba="0.6 0.4 0.2 0.4"/>
+    </body>
+
     <light name="sun" pos="0 0 5" dir="0 0 -1" directional="true"
          diffuse="1 1 1" ambient="0.2 0.2 0.2" specular="0.2 0.2 0.2"
          castshadow="true"/>

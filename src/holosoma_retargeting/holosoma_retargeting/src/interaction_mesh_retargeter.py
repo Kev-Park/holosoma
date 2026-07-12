@@ -404,6 +404,17 @@ class InteractionMeshRetargeter:
         q = np.copy(q_locked_list[0])
         retargeted_motions = [q]
 
+        # Static collision TABLE (mustard pick scene): position the mocap 'table_link' box ONCE from
+        # the RESTING (pre-grab) bottle pose so the whole body is kept out of the table volume during
+        # the whole solve. mocap_pos persists across mj_forward (not part of qpos), so set-once holds.
+        # No-op for scenes without the mocap table (nmocap == 0). Box half-extents (0.5,1.0,0.43):
+        # near edge = obj_x - 0.35 (legacy grab-relative edge), so center_x = obj_x - 0.35 + 0.5;
+        # centered on the bottle in y; top at z = 0.86 (center 0.43). Robot is pre-filtered to face +x.
+        if self.robot_model.nmocap > 0:
+            _obj_rest = np.asarray(object_poses[0, :3], dtype=float)
+            self.robot_data.mocap_pos[0] = np.array([_obj_rest[0] - 0.35 + 0.5, _obj_rest[1], 0.43])
+            self.robot_data.mocap_quat[0] = np.array([1.0, 0.0, 0.0, 0.0])
+
         tetrahedra = []
         obj_pts_demo_list = []  # scaled object pts
         obj_pts_list = []  # original size object pts
@@ -1107,6 +1118,16 @@ class InteractionMeshRetargeter:
                 return False
             if "ground" in self._geom_names[g1] and self.object_name in self._geom_names[g2]:
                 return False
+            n1, n2 = self._geom_names[g1], self._geom_names[g2]
+            # Static collision TABLE ("table" mocap geom): enforce robot<->table non-penetration, but
+            # SKIP table<->object and table<->ground (the bottle rests on the table, the table on the
+            # floor — don't let the solver fight those). Only fires when a table geom is present.
+            if "table" in n1 or "table" in n2:
+                if ("table" in n1 and (self.object_name in n2 or "ground" in n2)) or (
+                    "table" in n2 and (self.object_name in n1 or "ground" in n1)
+                ):
+                    return False
+                return True
             return (
                 self.object_name in self._geom_names[g1]
                 or self.object_name in self._geom_names[g2]
