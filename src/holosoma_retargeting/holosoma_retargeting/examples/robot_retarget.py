@@ -152,8 +152,8 @@ def validate_config(cfg: RetargetingConfig) -> None:
     # Task-specific format requirements
     if cfg.task_type == "climbing" and cfg.data_format not in (None, "mocap"):
         raise ValueError("Climbing task requires 'mocap' data format")
-    if cfg.task_type == "object_interaction" and cfg.data_format not in (None, "smplh"):
-        raise ValueError("Object interaction requires 'smplh' data format")
+    if cfg.task_type == "object_interaction" and cfg.data_format not in (None, "smplh", "smplx"):
+        raise ValueError("Object interaction requires 'smplh' or 'smplx' data format")
     # robot_only accepts any format in the registry (already validated above)
 
 
@@ -254,12 +254,24 @@ def load_motion_data(
         object_poses = np.tile(np.array([[1, 0, 0, 0, 0, 0, 0]]), (num_frames, 1))
 
     elif task_type == "object_interaction":
-        pt_path = data_path / f"{task_name}.pt"
-        if not pt_path.exists():
-            raise FileNotFoundError(f"InterMimic data file not found: {pt_path}")
-
-        human_joints, object_poses = load_intermimic_data(str(pt_path))
-        smpl_scale = calculate_scale_factor(task_name, constants.ROBOT_HEIGHT)
+        # Prefer OmniControl-derived .npz (global_joint_positions + fabricated object_poses)
+        npz_path = data_path / f"{task_name}.npz"
+        if npz_path.exists():
+            human_data = np.load(str(npz_path))
+            human_joints = np.array(human_data["global_joint_positions"])
+            human_height = human_data["height"]
+            smpl_scale = constants.ROBOT_HEIGHT / human_height
+            if "object_poses" in human_data:
+                object_poses = np.array(human_data["object_poses"]).astype(np.float64)
+            else:
+                num_frames = human_joints.shape[0]
+                object_poses = np.tile(np.array([[1.0, 0, 0, 0, 0, 0, 0]]), (num_frames, 1))
+        else:
+            pt_path = data_path / f"{task_name}.pt"
+            if not pt_path.exists():
+                raise FileNotFoundError(f"InterMimic data file not found: {pt_path}")
+            human_joints, object_poses = load_intermimic_data(str(pt_path))
+            smpl_scale = calculate_scale_factor(task_name, constants.ROBOT_HEIGHT)
 
     elif task_type == "climbing":
         task_dir = data_path / task_name
