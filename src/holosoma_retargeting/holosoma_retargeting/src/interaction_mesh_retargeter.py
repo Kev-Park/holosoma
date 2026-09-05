@@ -719,11 +719,22 @@ class InteractionMeshRetargeter:
                     _A, _b, _xcom, _Jcom = _res
                     _h_now = _b - _A @ _xcom
                     _AJ = _A @ _Jcom[:, self.q_a_indices]
+                    # Reference the barrier to the PREVIOUS FRAME, not to the current SQP iterate.
+                    # solve_single_iteration() runs n_iter times per frame; conditioning on the
+                    # moving iterate compounds the contraction to ~(1-gamma)^n_iter per frame and
+                    # makes the effective rate depend on the iteration count. Anchoring to
+                    # h(q_t_last) makes the condition converge to the intended per-frame
+                    #     h(q_{k+1}) >= (1 - gamma) h(q_k)
+                    # as dq -> 0, so repeated iterations refine rather than over-drive it.
+                    _h_prev = _b - _A @ self._com_xy(q_t_last)
+                    _rhs = _h_now - (1.0 - _gamma) * _h_prev
                     if self.com_stability.slack_penalty > 0:
-                        com_slack = cp.Variable(nonneg=True, name="com_slack")
-                        constraints += [cp.Constant(_AJ) @ dqa <= _gamma * _h_now + com_slack]
+                        # One slack per polygon edge (a single shared scalar would let the worst
+                        # edge relax all of them together).
+                        com_slack = cp.Variable(_AJ.shape[0], nonneg=True, name="com_slack")
+                        constraints += [cp.Constant(_AJ) @ dqa <= _rhs + com_slack]
                     else:
-                        constraints += [cp.Constant(_AJ) @ dqa <= _gamma * _h_now]
+                        constraints += [cp.Constant(_AJ) @ dqa <= _rhs]
 
         # Joint limits constraints (actuated)
         if self.activate_joint_limits:
@@ -747,9 +758,12 @@ class InteractionMeshRetargeter:
                 z = dqa[idx] - (q_a_nominal[idx] - q_a_n_last[idx])
                 obj_terms.append(w_nominal_tracking * cp.sum_squares(z))
 
-        # CoM barrier relaxation penalty (kept large so the constraint is near-hard)
+        # CoM barrier relaxation: L1 (exact) penalty. A quadratic penalty is smooth at zero, so
+        # its optimum always carries slack > 0 and the constraint is never actually satisfied;
+        # an L1 penalty recovers the hard constraint exactly whenever it is feasible, and
+        # degrades gracefully (paying only for the violation it must) when it is not.
         if com_slack is not None:
-            obj_terms.append(float(self.com_stability.slack_penalty) * cp.square(com_slack))
+            obj_terms.append(float(self.com_stability.slack_penalty) * cp.sum(com_slack))
 
         # Q_diag cost
         Qd = np.asarray(self.Q_diag, dtype=float).reshape(-1)
@@ -1342,6 +1356,12 @@ class InteractionMeshRetargeter:
         mujoco.mj_jacSubtreeCom(self.robot_model, self.robot_data, jacp, self._com_root_body)
         J_com = jacp @ self._build_transform_qdot_to_qvel_fast()
         return A, b, x_com[:2], J_com[:2]
+
+    def _com_xy(self, q: np.ndarray) -> np.ndarray:
+        """Ground projection of the robot CoM for an arbitrary configuration."""
+        self.robot_data.qpos[:] = q
+        mujoco.mj_forward(self.robot_model, self.robot_data)
+        return np.asarray(self.robot_data.subtree_com[self._com_root_body], dtype=float)[:2]
 
     def _com_cbf_gamma(self, frame_idx: int) -> float | None:
         """Effective CBF rate for this frame, honouring rest_only and the ramp. None = skip."""

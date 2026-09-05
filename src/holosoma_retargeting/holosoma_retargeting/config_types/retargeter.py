@@ -70,7 +70,11 @@ class CoMStabilityConfig:
     """Shrink the support polygon inward by this many metres before enforcing (safety buffer)."""
 
     slack_penalty: float = 1e4
-    """Penalty on the relaxation slack. Large => near-hard. Set <=0 for a strictly hard constraint."""
+    """L1 penalty on the per-edge relaxation slack. Because the penalty is L1 (exact), any value
+    above the active objective's scale recovers the hard constraint when it is feasible -- it does
+    NOT need to dominate. holosoma's own objective weights are laplacian_weights=10 and
+    smooth_weight=0.2, so ~50-100 lets the barrier bind while still negotiating with the mesh
+    tracking term; 1e4 steamrolls it. Set <=0 for a strictly hard constraint."""
 
     rest_only: bool = False
     """If True, only enforce from ``rest_start_frame`` onward (static-stability is the wrong
@@ -109,6 +113,12 @@ class RetargeterConfig:
 
     foot_sticking_tolerance: float = 1e-3
     """Tolerance for foot sticking constraints in x, y."""
+
+    foot_sticking_velocity_threshold: float = 0.01
+    """Contact-detection threshold for foot sticking, in metres of toe travel PER FRAME (it is a
+    raw np.diff of positions, not divided by dt). It therefore scales with the frame rate: if the
+    input motion is resampled to k times its original rate, divide this by k to preserve the same
+    physical contact detection. Default 0.01 matches 20 Hz input."""
 
     foot_lock: FootLockConfig = field(default_factory=FootLockConfig)
     """Configuration for explicit frame-range based foot locking."""
