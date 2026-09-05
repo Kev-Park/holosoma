@@ -16,7 +16,7 @@ from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 from tqdm import tqdm
 from viser.extras import ViserUrdf  # type: ignore[import-not-found]
 
-from holosoma_retargeting.config_types.retargeter import FootLockConfig, SelfCollisionConfig
+from holosoma_retargeting.config_types.retargeter import CoMStabilityConfig, FootLockConfig, SelfCollisionConfig
 
 # Add src to path for direct execution
 src_path = Path(__file__).parent.parent / "src"
@@ -61,6 +61,7 @@ class InteractionMeshRetargeter:
         debug: bool = False,
         w_nominal_tracking_init: float = 5.0,
         nominal_tracking_tau: float = 10.0,
+        com_stability: CoMStabilityConfig | None = None,
     ):
         """This kinematic retargeter solves the diffIK problem with hard constraints in SQP style.
         During each SQP iteration, the problem is solved with the following constraints and costs:
@@ -172,6 +173,21 @@ class InteractionMeshRetargeter:
         self.w_nominal_tracking_init = w_nominal_tracking_init
         self.nominal_tracking_tau = nominal_tracking_tau
         self.track_nominal_indices = task_constants.NOMINAL_TRACKING_INDICES
+
+        # CoM static-stability barrier (see CoMStabilityConfig).
+        self.com_stability = com_stability or CoMStabilityConfig()
+        self._com_root_body = 0
+        if self.com_stability.enable:
+            # subtree_com of the root body == whole-robot CoM.
+            for _bid in range(1, self.robot_model.nbody):
+                if self.robot_model.body_parentid[_bid] == 0:
+                    self._com_root_body = _bid
+                    break
+            print(
+                f"[CoM-CBF] enabled: gamma={self.com_stability.gamma}, margin={self.com_stability.margin}, "
+                f"slack_penalty={self.com_stability.slack_penalty}, rest_only={self.com_stability.rest_only}"
+                + (f", rest_start_frame={self.com_stability.rest_start_frame}" if self.com_stability.rest_only else "")
+            )
 
     def _init_foot_lock(self, foot_lock: FootLockConfig | None) -> None:
         """Initialize foot lock configuration and normalize window mappings."""
@@ -689,6 +705,26 @@ class InteractionMeshRetargeter:
             rhs = self._self_collision_tolerance - phi
             constraints += [Ja_n @ dqa >= rhs]
 
+        # CoM static-stability barrier, discrete-time CBF form:
+        #   h(q) = b - A x_com(q) >= 0,  enforce h(q+dq) >= (1-gamma) h(q)
+        #   <=>  (A J_com) dq <= gamma * h(q)
+        # One linear inequality per polygon edge. Hard by default; relaxed with a penalised
+        # slack when that would be infeasible (ConstrainedMimic App. B.1).
+        com_slack = None
+        if self.com_stability.enable and self.q_a_init_idx < 12:
+            _gamma = self._com_cbf_gamma(frame_idx)
+            if _gamma is not None and _gamma > 0.0:
+                _res = self._com_support_halfspaces(q, foot_sticking)
+                if _res is not None:
+                    _A, _b, _xcom, _Jcom = _res
+                    _h_now = _b - _A @ _xcom
+                    _AJ = _A @ _Jcom[:, self.q_a_indices]
+                    if self.com_stability.slack_penalty > 0:
+                        com_slack = cp.Variable(nonneg=True, name="com_slack")
+                        constraints += [cp.Constant(_AJ) @ dqa <= _gamma * _h_now + com_slack]
+                    else:
+                        constraints += [cp.Constant(_AJ) @ dqa <= _gamma * _h_now]
+
         # Joint limits constraints (actuated)
         if self.activate_joint_limits:
             constraints += [
@@ -710,6 +746,10 @@ class InteractionMeshRetargeter:
             if idx.size > 0:
                 z = dqa[idx] - (q_a_nominal[idx] - q_a_n_last[idx])
                 obj_terms.append(w_nominal_tracking * cp.sum_squares(z))
+
+        # CoM barrier relaxation penalty (kept large so the constraint is near-hard)
+        if com_slack is not None:
+            obj_terms.append(float(self.com_stability.slack_penalty) * cp.square(com_slack))
 
         # Q_diag cost
         Qd = np.asarray(self.Q_diag, dtype=float).reshape(-1)
@@ -1228,6 +1268,95 @@ class InteractionMeshRetargeter:
                 raise NotImplementedError("BALL joint block not implemented.")
 
         return T
+
+    @staticmethod
+    def _hull_ccw(P: np.ndarray) -> np.ndarray | None:
+        """Counter-clockwise convex hull of 2D points (monotone chain)."""
+        P = np.unique(P, axis=0)
+        if len(P) < 3:
+            return None
+        P = P[np.lexsort((P[:, 1], P[:, 0]))]
+
+        def half(A):
+            s: list = []
+            for pt in A:
+                while len(s) >= 2:
+                    o, b = s[-2], s[-1]
+                    if (b[0] - o[0]) * (pt[1] - o[1]) - (b[1] - o[1]) * (pt[0] - o[0]) <= 0:
+                        s.pop()
+                    else:
+                        break
+                s.append(pt)
+            return s
+
+        H = np.array(half(P)[:-1] + half(P[::-1])[:-1])
+        return H if len(H) >= 3 else None
+
+    def _com_support_halfspaces(self, q: np.ndarray, foot_sticking):
+        """Support polygon of the PLANTED feet plus the CoM and its Jacobian.
+
+        Returns (A, b, x_com_xy, J_com_xy) with A x <= b describing the polygon (unit-norm
+        rows, shrunk inward by ``com_stability.margin``), so h = b - A x is a signed distance
+        in metres. J_com_xy is (2 x nq), matching the Jp @ T convention used by the other
+        Jacobians here. Returns None when no foot is planted or the polygon is degenerate.
+        """
+        left_key = right_key = None
+        for key in foot_sticking:
+            if key.lower().startswith("l"):
+                left_key = key
+            elif key.lower().startswith("r"):
+                right_key = key
+
+        _, p_WF_dict, _ = self._calc_manipulator_jacobians(q, links=self.foot_links, obj_frame=False)
+        pts = []
+        for key, p in p_WF_dict.items():
+            k = key.lower()
+            if ("left" in k) and (left_key is not None) and foot_sticking[left_key]:
+                pts.append(np.asarray(p, dtype=float)[:2])
+            elif ("right" in k) and (right_key is not None) and foot_sticking[right_key]:
+                pts.append(np.asarray(p, dtype=float)[:2])
+        if len(pts) < 3:
+            return None
+
+        H = self._hull_ccw(np.stack(pts))
+        if H is None:
+            return None
+        A_rows, b_vals = [], []
+        for i in range(len(H)):
+            a0, a1 = H[i], H[(i + 1) % len(H)]
+            e = a1 - a0
+            n = float(np.linalg.norm(e))
+            if n < 1e-9:
+                continue
+            A_rows.append([e[1] / n, -e[0] / n])
+            b_vals.append((e[1] * a0[0] - e[0] * a0[1]) / n)
+        if len(A_rows) < 3:
+            return None
+        A = np.asarray(A_rows)
+        b = np.asarray(b_vals) - float(self.com_stability.margin)
+
+        self.robot_data.qpos[:] = q
+        mujoco.mj_forward(self.robot_model, self.robot_data)
+        x_com = np.asarray(self.robot_data.subtree_com[self._com_root_body], dtype=float)
+        jacp = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
+        mujoco.mj_jacSubtreeCom(self.robot_model, self.robot_data, jacp, self._com_root_body)
+        J_com = jacp @ self._build_transform_qdot_to_qvel_fast()
+        return A, b, x_com[:2], J_com[:2]
+
+    def _com_cbf_gamma(self, frame_idx: int) -> float | None:
+        """Effective CBF rate for this frame, honouring rest_only and the ramp. None = skip."""
+        cs = self.com_stability
+        if not cs.rest_only:
+            return cs.gamma
+        s0 = int(cs.rest_start_frame)
+        if s0 < 0:
+            return None
+        ramp = max(int(cs.ramp_frames), 0)
+        if frame_idx >= s0:
+            return cs.gamma
+        if ramp > 0 and frame_idx >= s0 - ramp:
+            return cs.gamma * float(frame_idx - (s0 - ramp)) / float(ramp)
+        return None
 
     def _calc_contact_jacobian_from_point(self, body_idx: int, p_body: np.ndarray, input_world=False):
         """
