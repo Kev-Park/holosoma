@@ -420,6 +420,19 @@ class InteractionMeshRetargeter:
         q = np.copy(q_locked_list[0])
         retargeted_motions = [q]
 
+        # Contact-based rest start: the first frame of the final contiguous double-support run.
+        # Derived once per motion so the barrier's rest gating uses the same contact data the
+        # support polygon itself is built from.
+        if self.com_stability.enable and self.com_stability.rest_only:
+            if int(self.com_stability.rest_start_frame) >= 0:
+                self._com_rest_start = int(self.com_stability.rest_start_frame)
+                _src = "config"
+            else:
+                self._com_rest_start = self._derive_rest_start(foot_sticking_sequences)
+                _src = "contact schedule"
+            print(f"[CoM-CBF] rest starts at frame {self._com_rest_start}/{num_frames} "
+                  f"(from {_src}); margin ramps in over {self.com_stability.ramp_frames} frames")
+
         tetrahedra = []
         obj_pts_demo_list = []  # scaled object pts
         obj_pts_list = []  # original size object pts
@@ -712,9 +725,10 @@ class InteractionMeshRetargeter:
         # slack when that would be infeasible (ConstrainedMimic App. B.1).
         com_slack = None
         if self.com_stability.enable and self.q_a_init_idx < 12:
-            _gamma = self._com_cbf_gamma(frame_idx)
-            if _gamma is not None and _gamma > 0.0:
-                _res = self._com_support_halfspaces(q, foot_sticking)
+            _act = self._com_cbf_active(frame_idx)
+            if _act is not None and _act[0] > 0.0:
+                _gamma, _mscale = _act
+                _res = self._com_support_halfspaces(q, foot_sticking, _mscale)
                 if _res is not None:
                     _A, _b, _xcom, _Jcom = _res
                     _h_now = _b - _A @ _xcom
@@ -1306,7 +1320,7 @@ class InteractionMeshRetargeter:
         H = np.array(half(P)[:-1] + half(P[::-1])[:-1])
         return H if len(H) >= 3 else None
 
-    def _com_support_halfspaces(self, q: np.ndarray, foot_sticking):
+    def _com_support_halfspaces(self, q: np.ndarray, foot_sticking, margin_scale: float = 1.0):
         """Support polygon of the PLANTED feet plus the CoM and its Jacobian.
 
         Returns (A, b, x_com_xy, J_com_xy) with A x <= b describing the polygon (unit-norm
@@ -1347,7 +1361,7 @@ class InteractionMeshRetargeter:
         if len(A_rows) < 3:
             return None
         A = np.asarray(A_rows)
-        b = np.asarray(b_vals) - float(self.com_stability.margin)
+        b = np.asarray(b_vals) - float(self.com_stability.margin) * float(margin_scale)
 
         self.robot_data.qpos[:] = q
         mujoco.mj_forward(self.robot_model, self.robot_data)
@@ -1363,19 +1377,51 @@ class InteractionMeshRetargeter:
         mujoco.mj_forward(self.robot_model, self.robot_data)
         return np.asarray(self.robot_data.subtree_com[self._com_root_body], dtype=float)[:2]
 
-    def _com_cbf_gamma(self, frame_idx: int) -> float | None:
-        """Effective CBF rate for this frame, honouring rest_only and the ramp. None = skip."""
+    @staticmethod
+    def _derive_rest_start(foot_sticking_sequences) -> int:
+        """First frame of the FINAL contiguous double-support run.
+
+        "Rest" = the last time both feet become planted and stay planted through the end of the
+        motion. Contact-based rather than velocity-based, so it admits a settled pose that still
+        carries momentum -- which a velocity threshold excludes by construction.
+        Returns -1 if the motion does not end in double support.
+        """
+        def _both(fs) -> bool:
+            left = right = None
+            for k in fs:
+                if k.lower().startswith("l"):
+                    left = fs[k]
+                elif k.lower().startswith("r"):
+                    right = fs[k]
+            return bool(left) and bool(right)
+
+        n = len(foot_sticking_sequences)
+        if n == 0 or not _both(foot_sticking_sequences[-1]):
+            return -1
+        s = n - 1
+        while s > 0 and _both(foot_sticking_sequences[s - 1]):
+            s -= 1
+        return s
+
+    def _com_cbf_active(self, frame_idx: int):
+        """(gamma, margin_scale) for this frame, or None to skip it entirely.
+
+        gamma is held CONSTANT and the fade-in ramps the polygon MARGIN instead. Ramping gamma
+        would invert the intent: for a safe state the constraint is (A J_com) dq <= gamma*h, so
+        gamma -> 0 forbids any approach to the boundary -- most restrictive exactly where the
+        fade is supposed to be weakest.
+        """
         cs = self.com_stability
         if not cs.rest_only:
-            return cs.gamma
-        s0 = int(cs.rest_start_frame)
+            return cs.gamma, 1.0
+        s0 = int(getattr(self, "_com_rest_start", cs.rest_start_frame))
         if s0 < 0:
             return None
-        ramp = max(int(cs.ramp_frames), 0)
         if frame_idx >= s0:
-            return cs.gamma
+            return cs.gamma, 1.0
+        ramp = max(int(cs.ramp_frames), 0)
         if ramp > 0 and frame_idx >= s0 - ramp:
-            return cs.gamma * float(frame_idx - (s0 - ramp)) / float(ramp)
+            return cs.gamma, float(frame_idx - (s0 - ramp)) / float(ramp)
         return None
 
     def _calc_contact_jacobian_from_point(self, body_idx: int, p_body: np.ndarray, input_world=False):

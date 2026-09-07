@@ -69,7 +69,7 @@ class CoMStabilityConfig:
     margin: float = 0.02
     """Shrink the support polygon inward by this many metres before enforcing (safety buffer)."""
 
-    slack_penalty: float = 1e4
+    slack_penalty: float = 50.0
     """L1 penalty on the per-edge relaxation slack. Because the penalty is L1 (exact), any value
     above the active objective's scale recovers the hard constraint when it is feasible -- it does
     NOT need to dominate. holosoma's own objective weights are laplacian_weights=10 and
@@ -81,10 +81,21 @@ class CoMStabilityConfig:
     criterion during locomotion, which is deliberately statically unstable)."""
 
     rest_start_frame: int = -1
-    """First frame index at which to enforce when ``rest_only``. -1 disables enforcement."""
+    """First frame index at which to enforce when ``rest_only``.
+
+    -1 (default) DERIVES it from the contact schedule: the first frame of the final contiguous
+    double-support run, i.e. the last time both feet become planted and stay planted through the
+    end of the motion. That is contact-based, so it correctly admits a settled pose that still
+    carries momentum -- a velocity threshold excludes exactly that case. Set a non-negative value
+    to override with an explicit frame index."""
 
     ramp_frames: int = 10
-    """Frames over which to ramp gamma in before ``rest_start_frame``, avoiding a seam."""
+    """Frames before the rest start over which to fade the constraint in.
+
+    The fade ramps the polygon MARGIN from 0 to ``margin``, NOT gamma. Ramping gamma would do the
+    opposite of a fade-in: for a safe state the constraint is (A J_com) dq <= gamma*h, so gamma->0
+    forbids any motion toward the boundary at all -- most restrictive exactly where the fade is
+    meant to be weakest."""
 
 
 @dataclass(frozen=True)
