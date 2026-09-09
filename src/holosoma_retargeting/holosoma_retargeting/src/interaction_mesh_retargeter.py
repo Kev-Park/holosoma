@@ -1420,8 +1420,17 @@ class InteractionMeshRetargeter:
         if frame_idx >= s0:
             return cs.gamma, 1.0
         ramp = max(int(cs.ramp_frames), 0)
+        # Never let the fade start before frame 0: otherwise a ramp longer than the rest start
+        # begins already partly engaged (a step onto the constraint), which is the opposite of
+        # a fade. Clamping keeps the full 0 -> 1 sweep inside the available frames.
+        ramp = min(ramp, s0)
         if ramp > 0 and frame_idx >= s0 - ramp:
-            return cs.gamma, float(frame_idx - (s0 - ramp)) / float(ramp)
+            t = float(frame_idx - (s0 - ramp)) / float(ramp)
+            # C2 smootherstep t^3(6t^2 - 15t + 10): zero FIRST and SECOND derivative at both
+            # ends. A linear ramp kinks at t=0 and t=1 -- the margin's rate of tightening jumps
+            # discontinuously there, and the retarget shows it as a visible hitch. Smootherstep
+            # eases in and out, so the constraint arrives and saturates without a slope step.
+            return cs.gamma, t * t * t * (t * (6.0 * t - 15.0) + 10.0)
         return None
 
     def _calc_contact_jacobian_from_point(self, body_idx: int, p_body: np.ndarray, input_world=False):

@@ -92,6 +92,11 @@ class CoMStabilityConfig:
     ramp_frames: int = 10
     """Frames before the rest start over which to fade the constraint in.
 
+    The fade follows a C2 smootherstep (zero 1st and 2nd derivative at both ends), so the
+    margin arrives and saturates without a slope discontinuity; it is clamped to the rest
+    start so the full 0 -> 1 sweep always fits before it. Longer = gentler: at 20 fps, 10
+    frames is 0.5 s, 40 frames is 2.0 s.
+
     The fade ramps the polygon MARGIN from 0 to ``margin``, NOT gamma. Ramping gamma would do the
     opposite of a fade-in: for a safe state the constraint is (A J_com) dq <= gamma*h, so gamma->0
     forbids any motion toward the boundary at all -- most restrictive exactly where the fade is
