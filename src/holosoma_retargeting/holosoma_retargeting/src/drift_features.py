@@ -135,7 +135,12 @@ def features_and_jac(qpos, lf_world, rf_world, J_lf, J_rf,
                   _calc_manipulator_jacobians, already qpos-converted by T)
     prev_*      : the SOLVED previous frame's quantities (constants here)
     """
-    nq = len(qpos)
+    # Width comes from the JACOBIAN, not from len(qpos): the retargeting model's
+    # configuration carries the 7-DOF object pose after the robot's 36, so these
+    # two differ (43 vs 36) and building the selection matrix from len(qpos)
+    # silently mismatches. Columns 0:3 (root translation) and 3:7 (root quat) are
+    # at the same offsets in both.
+    nq = J_lf.shape[1]
     root = qpos[0:3]
     quat = qpos[3:7]
     yaw = yaw_of(quat)
