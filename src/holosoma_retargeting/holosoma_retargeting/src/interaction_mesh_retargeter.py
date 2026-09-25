@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -93,6 +94,28 @@ class InteractionMeshRetargeter:
         self.activate_obj_non_penetration = activate_obj_non_penetration
         self.activate_joint_limits = activate_joint_limits
         self.foot_links = dict(zip(task_constants.FOOT_STICKING_LINKS, task_constants.FOOT_STICKING_LINKS))
+
+        # Learned SONIC drift objective (opt-in; off unless HS_DRIFT_MODEL is set).
+        # NOTE: the drift features use the ankle_roll_link body, NOT the foot-sticking
+        # sphere links -- those sit ~4.6 cm away and the model was trained on the former.
+        self._drift_links = {
+            "left": "left_ankle_roll_link",
+            "right": "right_ankle_roll_link",
+        }
+        self._drift = None
+        _dm = os.environ.get("HS_DRIFT_MODEL", "")
+        if _dm:
+            from .drift_objective import DriftObjective, MLPNumpy
+
+            self._drift = DriftObjective(
+                MLPNumpy.load(_dm),
+                lam=float(os.environ.get("HS_DRIFT_LAMBDA", "0")),
+                e_idx=tuple(int(v) for v in os.environ.get("HS_DRIFT_EIDX", "1").split(",")),
+            )
+            print(
+                f"[drift] objective ON: model={_dm} lambda={self._drift.lam} "
+                f"e_idx={list(self._drift.e_idx)} (1 = dy only; dx excluded on purpose)"
+            )
         self.penetration_tolerance = penetration_tolerance
         self.step_size = step_size
         self.visualize = visualize
@@ -512,6 +535,24 @@ class InteractionMeshRetargeter:
                     )
 
                 retargeted_motions.append(q)
+
+                # Roll the drift objective's per-frame state forward. The features
+                # use BACKWARD differences and e is integrated along the clip, so
+                # this has to happen once per accepted frame, not per SQP iteration.
+                if self._drift is not None:
+                    _, _p_df, _ = self._calc_manipulator_jacobians(
+                        q, links=self._drift_links, obj_frame=False
+                    )
+                    if self._drift.prev is None:
+                        self._drift.reset(q, _p_df["left"], _p_df["right"])
+                    else:
+                        _J_df, _, _ = self._calc_manipulator_jacobians(
+                            q, links=self._drift_links, obj_frame=False
+                        )
+                        self._drift.advance(
+                            q, _p_df["left"], _p_df["right"], _J_df["left"], _J_df["right"]
+                        )
+
                 if self.visualize and self.debug:
                     self.draw_q(q)
 
@@ -782,6 +823,26 @@ class InteractionMeshRetargeter:
         # Q_diag cost
         Qd = np.asarray(self.Q_diag, dtype=float).reshape(-1)
         obj_terms.append(cp.sum_squares(cp.multiply(np.sqrt(Qd), dqa + q_a_n_last)))
+
+        # Learned SONIC drift objective. Affine in dqa, so the problem stays a QP.
+        # Gradient path: dg/dphi (analytic, from the net) @ dphi/dqpos (analytic,
+        # verified against finite differences to 1e-10) -- see drift_features.
+        if self._drift is not None and self._drift.lam > 0 and self._drift.prev is not None:
+            _J_df, _p_df, _ = self._calc_manipulator_jacobians(
+                q, links=self._drift_links, obj_frame=False
+            )
+            _term = self._drift.cost_term(
+                q,
+                _p_df["left"],
+                _p_df["right"],
+                _J_df["left"],
+                _J_df["right"],
+                dqa,
+                self.q_a_indices,
+                cp,
+            )
+            if _term is not None:
+                obj_terms.append(_term)
 
         # Smoothness cost
         dqa_smooth = q_t_last[self.q_a_indices] - q_a_n_last
