@@ -113,11 +113,12 @@ class InteractionMeshRetargeter:
                 e_idx=tuple(int(v) for v in os.environ.get("HS_DRIFT_EIDX", "1").split(",")),
                 deadband=float(os.environ.get("HS_DRIFT_DEADBAND", "0")),
                 protect_forward=os.environ.get("HS_DRIFT_PROTECT_FWD", "0") == "1",
+                target=os.environ.get("HS_DRIFT_TARGET", "state"),
             )
             print(
                 f"[drift] objective ON: model={_dm} lambda={self._drift.lam} "
                 f"e_idx={list(self._drift.e_idx)} deadband={self._drift.deadband} "
-                f"protect_fwd={self._drift.protect_forward}"
+                f"protect_fwd={self._drift.protect_forward} target={self._drift.target}"
             )
         self.penetration_tolerance = penetration_tolerance
         self.step_size = step_size

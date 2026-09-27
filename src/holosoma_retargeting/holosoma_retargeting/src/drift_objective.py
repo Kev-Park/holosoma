@@ -69,16 +69,24 @@ class DriftObjective:
     """
 
     def __init__(self, model, lam=1.0, e_idx=(1,), dt=dfeat.DT, max_e=1.0,
-                 deadband=0.0, protect_forward=False):
+                 deadband=0.0, protect_forward=False, target="state"):
         """e_idx: which components of e = (dx, dy, dyaw) this model predicts.
 
         Default (1,) = dy ONLY: dx is only weakly predictable (clip-mean rank
         rho +0.20 at n=388, vs +0.74 for dy), so it is not worth optimising --
         but it IS worth protecting, see protect_forward.
 
-        deadband: skip the term entirely while the predicted error is below this
-        (metres). Driving the prediction to ZERO pushes on clips that are already
+        deadband: skip the term entirely while the predicted quantity is below
+        this. UNITS DEPEND ON target: metres for "state", m/s for "rate" (where
+        typical |g| is ~0.009, so a 0.02 threshold would skip every frame). Driving the prediction to ZERO pushes on clips that are already
         fine; a measured lambda=20 run took one clip from 0.0024 m to 0.0359 m.
+
+        target: "rate" (recommended) penalises the predicted drift RATE, ||g||^2.
+        "state" penalises ||e + g*dt||^2, which asks each frame to undo ALL
+        accumulated error in one step -- with e ~ 0.04 m and dt = 1/30 s that
+        demands ~1.2 m/s of correction, so the trust region clips it and the
+        solver merely deforms the motion. Measured: under "state" the SQP did not
+        reduce even the MODEL'S OWN prediction (dPred +0.023 at lambda=20).
 
         protect_forward: project the descent direction to remove its component
         along forward velocity. Forward drift degraded in every intervention run
@@ -92,6 +100,7 @@ class DriftObjective:
         self.out_dim = len(self.e_idx)
         self.dt = dt
         self.max_e = max_e        # clamp: keep a diverging rollout from dominating
+        self.target = str(target)   # "state" | "rate"
         self.deadband = float(deadband)
         self.protect_forward = bool(protect_forward)
         self.n_skipped = 0        # frames the deadband left alone
@@ -132,7 +141,12 @@ class DriftObjective:
         G_phi = G[:, :dfeat.FEATURE_DIM]          # e is constant within this frame
         A = G_phi @ J_phi                          # (out_dim, nq)
         A_a = A[:, q_a_indices] * self.dt
-        c0 = self.e[self.e_idx] + g0 * self.dt
+        if self.target == "rate":
+            c0 = g0.copy()                 # drive the predicted RATE to zero
+            scale = 1.0
+        else:
+            c0 = self.e[self.e_idx] + g0 * self.dt
+            scale = self.dt
 
         # Deadband: leave already-good frames alone instead of chasing zero.
         if self.deadband > 0.0 and float(np.linalg.norm(c0)) <= self.deadband:
@@ -148,7 +162,7 @@ class DriftObjective:
                 A_a = A_a - np.outer(A_a @ u / uu, u)
 
         self.n_applied += 1
-        return self.lam * cp.sum_squares(c0 + A_a @ dqa)
+        return self.lam * cp.sum_squares(c0 + (A_a * scale) @ dqa)
 
     def advance(self, q, lf, rf, J_lf, J_rf):
         """Integrate the error estimate and roll the backward-difference state."""
