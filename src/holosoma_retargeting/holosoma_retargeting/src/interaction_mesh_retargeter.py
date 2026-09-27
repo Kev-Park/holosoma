@@ -38,6 +38,9 @@ from utils import (  # type: ignore[import-not-found,no-redef]  # noqa: E402
 from viser_utils import create_motion_control_sliders  # type: ignore[import-not-found,no-redef]  # noqa: E402
 
 
+_SQP_ITERS = int(os.environ.get("HS_SQP_ITERS", "10"))
+_SQP_ITERS0 = int(os.environ.get("HS_SQP_ITERS0", "50"))
+
 class InteractionMeshRetargeter:
     """
     A class to perform kinematic retargeting from human motion to a robot,
@@ -527,7 +530,9 @@ class InteractionMeshRetargeter:
                     w_nominal_tracking=w_nominal_tracking,
                     q_a_nominal=(q_nominal_list[i, self.q_a_indices] if q_nominal_list is not None else None),
                     init_t=i == 0,
-                    n_iter=50 if i == 0 else 10,
+                    # Smaller trust regions need MORE steps: with step_size cut 4x the
+                    # solver cannot reach the same iterate in 10 inner iterations.
+                    n_iter=(_SQP_ITERS0 if i == 0 else _SQP_ITERS),
                     frame_idx=i,
                 )
                 if self.debug:
