@@ -163,7 +163,7 @@ class DriftObjective:
             # velocity.
             rows = [J_phi[1, q_a_indices]]
             if int(self.protect_forward) >= 2:
-                R = dfeat.Rz_inv(dfeat.yaw_of(qpos[3:7]))
+                R = dfeat.Rz_inv(dfeat.yaw_of(q[3:7]))
                 P = np.zeros((3, J_phi.shape[1]))
                 P[0, 0] = P[1, 1] = P[2, 2] = 1.0
                 rows.append((R[0] @ P[:2, :])[q_a_indices])   # d(root along-heading)/dq
