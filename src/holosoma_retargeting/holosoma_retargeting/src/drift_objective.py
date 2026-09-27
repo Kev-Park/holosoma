@@ -102,7 +102,7 @@ class DriftObjective:
         self.max_e = max_e        # clamp: keep a diverging rollout from dominating
         self.target = str(target)   # "state" | "rate"
         self.deadband = float(deadband)
-        self.protect_forward = bool(protect_forward)
+        self.protect_forward = float(protect_forward)   # 0 off, 1 velocity, 2 also position
         self.n_skipped = 0        # frames the deadband left alone
         self.n_applied = 0
         self.prev = None
@@ -156,10 +156,21 @@ class DriftObjective:
         # Protect forward progress: strip the component of the descent direction
         # that moves forward velocity (feature 1 = v_along in the heading frame).
         if self.protect_forward:
-            u = J_phi[1, q_a_indices]
-            uu = float(u @ u)
-            if uu > 1e-12:
-                A_a = A_a - np.outer(A_a @ u / uu, u)
+            # Project out v_along (feature 1). protect_forward >= 2 also pins the
+            # root's along-heading POSITION: dx degraded +0.0158 at rate lambda=1
+            # even with velocity protection, because forward progress can also
+            # move through foot placement and timing, not just instantaneous
+            # velocity.
+            rows = [J_phi[1, q_a_indices]]
+            if int(self.protect_forward) >= 2:
+                R = dfeat.Rz_inv(dfeat.yaw_of(qpos[3:7]))
+                P = np.zeros((3, J_phi.shape[1]))
+                P[0, 0] = P[1, 1] = P[2, 2] = 1.0
+                rows.append((R[0] @ P[:2, :])[q_a_indices])   # d(root along-heading)/dq
+            for u in rows:
+                uu = float(u @ u)
+                if uu > 1e-12:
+                    A_a = A_a - np.outer(A_a @ u / uu, u)
 
         self.n_applied += 1
         return self.lam * cp.sum_squares(c0 + (A_a * scale) @ dqa)

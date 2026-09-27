@@ -112,7 +112,7 @@ class InteractionMeshRetargeter:
                 lam=float(os.environ.get("HS_DRIFT_LAMBDA", "0")),
                 e_idx=tuple(int(v) for v in os.environ.get("HS_DRIFT_EIDX", "1").split(",")),
                 deadband=float(os.environ.get("HS_DRIFT_DEADBAND", "0")),
-                protect_forward=os.environ.get("HS_DRIFT_PROTECT_FWD", "0") == "1",
+                protect_forward=float(os.environ.get("HS_DRIFT_PROTECT_FWD", "0")),
                 target=os.environ.get("HS_DRIFT_TARGET", "state"),
             )
             print(
