@@ -68,12 +68,23 @@ class DriftObjective:
         obj.advance(q_solved, lf_solved, rf_solved)   # after each frame
     """
 
-    def __init__(self, model, lam=1.0, e_idx=(1,), dt=dfeat.DT, max_e=1.0):
+    def __init__(self, model, lam=1.0, e_idx=(1,), dt=dfeat.DT, max_e=1.0,
+                 deadband=0.0, protect_forward=False):
         """e_idx: which components of e = (dx, dy, dyaw) this model predicts.
 
-        Default (1,) = dy ONLY. dx is deliberately excluded: measured clip-mean
-        sign agreement for dx is 0.40, i.e. WORSE than chance, so including it
-        would push the solver the wrong way on roughly 60% of clips.
+        Default (1,) = dy ONLY: dx is only weakly predictable (clip-mean rank
+        rho +0.20 at n=388, vs +0.74 for dy), so it is not worth optimising --
+        but it IS worth protecting, see protect_forward.
+
+        deadband: skip the term entirely while the predicted error is below this
+        (metres). Driving the prediction to ZERO pushes on clips that are already
+        fine; a measured lambda=20 run took one clip from 0.0024 m to 0.0359 m.
+
+        protect_forward: project the descent direction to remove its component
+        along forward velocity. Forward drift degraded in every intervention run
+        (+0.012 to +0.023 m) because nothing stopped the solver buying lateral
+        improvement with forward progress. dx cannot be modelled well enough to
+        optimise, but this constrains it without needing a model at all.
         """
         self.model = model
         self.lam = float(lam)
@@ -81,6 +92,10 @@ class DriftObjective:
         self.out_dim = len(self.e_idx)
         self.dt = dt
         self.max_e = max_e        # clamp: keep a diverging rollout from dominating
+        self.deadband = float(deadband)
+        self.protect_forward = bool(protect_forward)
+        self.n_skipped = 0        # frames the deadband left alone
+        self.n_applied = 0
         self.prev = None
         self.e = np.zeros(3)
 
@@ -118,6 +133,21 @@ class DriftObjective:
         A = G_phi @ J_phi                          # (out_dim, nq)
         A_a = A[:, q_a_indices] * self.dt
         c0 = self.e[self.e_idx] + g0 * self.dt
+
+        # Deadband: leave already-good frames alone instead of chasing zero.
+        if self.deadband > 0.0 and float(np.linalg.norm(c0)) <= self.deadband:
+            self.n_skipped += 1
+            return None
+
+        # Protect forward progress: strip the component of the descent direction
+        # that moves forward velocity (feature 1 = v_along in the heading frame).
+        if self.protect_forward:
+            u = J_phi[1, q_a_indices]
+            uu = float(u @ u)
+            if uu > 1e-12:
+                A_a = A_a - np.outer(A_a @ u / uu, u)
+
+        self.n_applied += 1
         return self.lam * cp.sum_squares(c0 + A_a @ dqa)
 
     def advance(self, q, lf, rf, J_lf, J_rf):

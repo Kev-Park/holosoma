@@ -111,10 +111,13 @@ class InteractionMeshRetargeter:
                 MLPNumpy.load(_dm),
                 lam=float(os.environ.get("HS_DRIFT_LAMBDA", "0")),
                 e_idx=tuple(int(v) for v in os.environ.get("HS_DRIFT_EIDX", "1").split(",")),
+                deadband=float(os.environ.get("HS_DRIFT_DEADBAND", "0")),
+                protect_forward=os.environ.get("HS_DRIFT_PROTECT_FWD", "0") == "1",
             )
             print(
                 f"[drift] objective ON: model={_dm} lambda={self._drift.lam} "
-                f"e_idx={list(self._drift.e_idx)} (1 = dy only; dx excluded on purpose)"
+                f"e_idx={list(self._drift.e_idx)} deadband={self._drift.deadband} "
+                f"protect_fwd={self._drift.protect_forward}"
             )
         self.penetration_tolerance = penetration_tolerance
         self.step_size = step_size
