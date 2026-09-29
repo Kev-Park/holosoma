@@ -94,6 +94,13 @@ class InteractionMeshRetargeter:
         self.object_name = task_constants.OBJECT_NAME
         self.collision_detection_threshold = collision_detection_threshold
         self.activate_foot_sticking = activate_foot_sticking
+        # HS_FOOT_STICK_ANCHOR=1: measure the sticking box from the foot position at STANCE
+        # ONSET instead of from the previous frame. The per-frame box lets a "stuck" foot creep
+        # up to `tolerance` EVERY frame, so the drift it permits compounds with stance length and
+        # frame rate (20 frames x 1e-3 = 2 cm). Anchored, `tolerance` means total drift per
+        # stance, which is what foot sticking physically means and is frame-rate independent.
+        self.foot_stick_anchor = os.environ.get("HS_FOOT_STICK_ANCHOR", "0") == "1"
+        self._stick_anchor: dict = {}
         self.activate_obj_non_penetration = activate_obj_non_penetration
         self.activate_joint_limits = activate_joint_limits
         self.foot_links = dict(zip(task_constants.FOOT_STICKING_LINKS, task_constants.FOOT_STICKING_LINKS))
@@ -463,6 +470,9 @@ class InteractionMeshRetargeter:
             print(f"[CoM-CBF] rest starts at frame {self._com_rest_start}/{num_frames} "
                   f"(from {_src}); margin ramps in over {self.com_stability.ramp_frames} frames")
 
+        # per-stance foot anchors are per-motion state
+        self._stick_anchor = {}
+
         tetrahedra = []
         obj_pts_demo_list = []  # scaled object pts
         obj_pts_list = []  # original size object pts
@@ -727,8 +737,18 @@ class InteractionMeshRetargeter:
                 for key, J_WF in J_WF_dict.items():
                     apply_left = ("left" in key) and foot_sticking[left_key]
                     apply_right = ("right" in key) and foot_sticking[right_key]
+                    if self.foot_stick_anchor:
+                        if not (apply_left or apply_right):
+                            # stance ended: drop the anchor so the next stance re-anchors
+                            self._stick_anchor.pop(key, None)
+                        elif key not in self._stick_anchor:
+                            # stance ONSET: freeze the reference the box is measured from
+                            self._stick_anchor[key] = np.array(p_WF_t_last_dict[key], copy=True)
                     if apply_left or apply_right:
-                        p_lb = p_WF_t_last_dict[key] - p_WF_dict[key] - self.foot_sticking_tolerance
+                        p_ref = (self._stick_anchor[key]
+                                 if (self.foot_stick_anchor and key in self._stick_anchor)
+                                 else p_WF_t_last_dict[key])
+                        p_lb = p_ref - p_WF_dict[key] - self.foot_sticking_tolerance
                         p_ub = p_lb + 2 * self.foot_sticking_tolerance  # symmetric window
 
                         Jxy = J_WF[:2, self.q_a_indices]  # (2 x nq_act)
