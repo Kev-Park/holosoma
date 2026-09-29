@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
@@ -295,6 +296,21 @@ JOINTS_MAPPINGS = {
         "RightFoot": "Ankle_Cross_Right",
     },
 }
+
+if os.environ.get("HS_SPHEREHAND", "0") == "1":
+    # Pairs with the g1_29dof_spherehand.urdf selection in config_types/robot.py: that URDF
+    # has no *_rubber_hand_link, so every g1 mapping that targets the wrist there must move
+    # to the sphere-hand link or FK lookup raises. Changes WHICH link is driven to the wrist
+    # target (the sphere hand sits at a different offset), so it is an experimental variant,
+    # not a cosmetic swap -- hence the flag, default off.
+    for _fmt_key, _mapping in JOINTS_MAPPINGS.items():
+        if _fmt_key[1] != "g1":
+            continue
+        for _src, _dst in list(_mapping.items()):
+            if _dst == "left_rubber_hand_link":
+                _mapping[_src] = "left_sphere_hand_link"
+            elif _dst == "right_rubber_hand_link":
+                _mapping[_src] = "right_sphere_hand_link"
 
 # Data format specific constants
 TOE_NAMES_BY_FORMAT = {

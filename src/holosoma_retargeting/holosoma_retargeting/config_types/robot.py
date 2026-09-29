@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Mapping, TypedDict
 
@@ -121,6 +122,12 @@ class RobotConfig:
         """Get robot URDF file path."""
         if self.robot_urdf_file is not None:
             return self.robot_urdf_file
+        if self.robot_type == "g1" and os.environ.get("HS_SPHEREHAND", "0") == "1":
+            # A/B (HS_SPHEREHAND=1): sphere-hand collision model. This URDF DROPS the
+            # rubber-hand/thumb/pinky links and adds *_sphere_hand[_tip]_link, so it only
+            # works together with the sphere_hand wrist mapping that the same env var
+            # applies in data_type.py. Actuated joints are identical (30, same order).
+            return f"models/g1/g1_{self.ROBOT_DOF}dof_spherehand.urdf"
         return f"models/{self.robot_type}/{self.robot_type}_{self.ROBOT_DOF}dof.urdf"
 
     ROBOT_URDF_FILE = property(_robot_urdf_file, doc="Get robot URDF file path.")
